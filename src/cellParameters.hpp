@@ -256,7 +256,9 @@ class Object
 public:
 	Object(){};
 	~Object(){};
-	Object( string type, Vector2d position, Vector3d rgb, double z, double size = 0, Vector2d direction = Vector2d::Zero() )
+	// capForeshorten < 0 means "no end caps drawn" (used for circles, and lines in modes
+	// that don't want a perspective-correct cylinder end cap).
+	Object( string type, Vector2d position, Vector3d rgb, double z, double size = 0, Vector2d direction = Vector2d::Zero(), double capForeshorten = -1 )
 	{
 		_type = type;
 		_position = position;
@@ -268,6 +270,7 @@ public:
 		_size = size;
 		_direction = direction;
 		_rgb = rgb;
+		_capForeshorten = capForeshorten;
 	}
 
 	string getType(){return _type;}
@@ -275,6 +278,7 @@ public:
 	Vector2d getPosition(){ return _position; }
 	Vector2d getDirection(){ return _direction; }
 	Vector3d getRGB(){return _rgb;}
+	double getCapForeshorten(){ return _capForeshorten; }
 	void addX( double x ) { _position(0) += x; _direction(0)+= x; }
 	void addY( double y ) { _position(1) += y; _direction(1)+=y; }
 
@@ -293,6 +297,7 @@ private:
 	double _size;
 	Vector2d _direction;
 	Vector3d _rgb;
+	double _capForeshorten;
 
 };
 typedef boost::shared_ptr<Object> ObjectPtr;

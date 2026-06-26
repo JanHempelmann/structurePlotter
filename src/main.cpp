@@ -641,7 +641,78 @@ bool PointerCompare ( const boost::shared_ptr<Object> l, const boost::shared_ptr
 	return l->getZ() < r->getZ();
 }
 
-vector<ObjectPtr> generateObjects( UnitCellPtr unitCell)
+enum BondDrawMode
+{
+	BOND_CENTER = 0,      // bonds drawn between atom centers (original behavior)
+	BOND_CLIP_SCREEN = 1, // bonds clipped to the projected (2D) atom circle
+	BOND_CLIP_REAL = 2    // bonds clipped to the real (3D) atom sphere, then projected
+};
+
+// Atom radii are drawn on screen as 0.4 * scale * size (see exportFile). Since the
+// projection is orthographic, a sphere of real radius 0.4 * size projects to exactly
+// that screen circle, so the same constant doubles as the "real" sphere radius.
+double atomRadius( AtomPtr atom )
+{
+	return 0.4 * atom->getSize();
+}
+
+// Shrinks rA/rB proportionally if they would overlap/invert the segment between a and b.
+template <typename VectorT>
+void clampTrimRadii( const VectorT& a, const VectorT& b, double& rA, double& rB )
+{
+	double len = (b - a).norm();
+	if ( rA + rB > len && rA + rB > 1e-9 )
+	{
+		double k = len / (rA + rB);
+		rA *= k;
+		rB *= k;
+	}
+}
+
+pair<Vector2d,Vector2d> bondEndpoints2D( AtomPtr atomA, AtomPtr atomB, int bondDrawMode )
+{
+	Vector2d a2 = atomA->getCoordinatesReal().head(2);
+	Vector2d b2 = atomB->getCoordinatesReal().head(2);
+
+	if ( bondDrawMode == BOND_CENTER )
+		return make_pair(a2, b2);
+
+	if ( bondDrawMode == BOND_CLIP_SCREEN )
+	{
+		double len = (b2 - a2).norm();
+		if ( len < 1e-9 )
+			return make_pair(a2, b2);
+
+		double rA = atomRadius(atomA);
+		double rB = atomRadius(atomB);
+		clampTrimRadii(a2, b2, rA, rB);
+
+		Vector2d unit = (b2 - a2) / len;
+		return make_pair( a2 + rA * unit, b2 - rB * unit );
+	}
+
+	// BOND_CLIP_REAL: trim along the true 3D bond axis by the real sphere radius,
+	// then project to 2D, so foreshortened bonds appear to dive into the sphere
+	// rather than stopping exactly on the screen circle's rim.
+	Vector3d a3 = atomA->getCoordinatesReal();
+	Vector3d b3 = atomB->getCoordinatesReal();
+
+	double len = (b3 - a3).norm();
+	if ( len < 1e-9 )
+		return make_pair(a2, b2);
+
+	double rA = atomRadius(atomA);
+	double rB = atomRadius(atomB);
+	clampTrimRadii(a3, b3, rA, rB);
+
+	Vector3d unit = (b3 - a3) / len;
+	Vector3d start = a3 + rA * unit;
+	Vector3d end = b3 - rB * unit;
+
+	return make_pair( start.head(2), end.head(2) );
+}
+
+vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode )
 {
 	vector<ObjectPtr> result;
 	for ( auto atom : unitCell->getAtoms() )
@@ -651,7 +722,22 @@ vector<ObjectPtr> generateObjects( UnitCellPtr unitCell)
 
 	for ( auto bond : unitCell->getBonds() )
 	{
-		result.push_back( boost::make_shared<Object>( "line", bond->getCoordinatesReal().head(2), bond->getRGB(), bond->getCoordinatesReal()(2), bond->getSize(), bond->getEnd().head(2)));
+		pair<Vector2d,Vector2d> endpoints = bondEndpoints2D( bond->getFrom(), bond->getTo(), bondDrawMode );
+
+		// In BOND_CLIP_REAL, cap the bond with a foreshortened ellipse representing
+		// its own circular cross section (a true cylinder end cap), rather than a
+		// flat cut. capForeshorten is the bond axis's z-component (how much it points
+		// toward/away from the viewer): 0 = side-on (cap degenerates to a flat line),
+		// 1 = pointing straight at the viewer (cap is a full circle).
+		double capForeshorten = -1;
+		if ( bondDrawMode == BOND_CLIP_REAL )
+		{
+			Vector3d axis = bond->getTo()->getCoordinatesReal() - bond->getFrom()->getCoordinatesReal();
+			double axisLen = axis.norm();
+			capForeshorten = ( axisLen > 1e-9 ) ? fabs(axis(2) / axisLen) : 1.0;
+		}
+
+		result.push_back( boost::make_shared<Object>( "line", endpoints.first, bond->getRGB(), bond->getCoordinatesReal()(2), bond->getSize(), endpoints.second, capForeshorten));
 	}
 
 	// sort objects by z value
@@ -776,11 +862,38 @@ void exportFile(vector<ObjectPtr> objects, string filename)
 			cout << "l total " << (scale*object->getDirection() - scale*object->getPosition()).norm() << endl;
 */			Vector3d rgb = object->getRGB();
 			cairo_set_source_rgb (cr, rgb(0)/255.0, rgb(1)/255.0,rgb(2)/255.0);
-			cairo_move_to (cr, xMargin + scale*object->getPosition()(0), yMargin + yLength - scale*object->getPosition()(1));
+
+			double x0 = xMargin + scale*object->getPosition()(0);
+			double y0 = yMargin + yLength - scale*object->getPosition()(1);
+			double x1 = xMargin + scale*object->getDirection()(0);
+			double y1 = yMargin + yLength - scale*object->getDirection()(1);
+
+			cairo_move_to (cr, x0, y0);
 			//cairo_rel_line_to(cr, scale*object->getDirection()(0), scale*object->getDirection()(1));
-			cairo_line_to(cr,  xMargin + scale*object->getDirection()(0), yMargin + yLength - scale*object->getDirection()(1));
+			cairo_line_to (cr, x1, y1);
 //			cairo_close_path (cr);
 			cairo_stroke (cr);
+
+			// perspective-correct cylinder end caps (BOND_CLIP_REAL only)
+			double capForeshorten = object->getCapForeshorten();
+			if ( capForeshorten > 1e-3 )
+			{
+				double capRadius = 0.5 * object->getSize();
+				double theta = atan2(y1 - y0, x1 - x0);
+				double endsX[2] = { x0, x1 };
+				double endsY[2] = { y0, y1 };
+
+				for ( int end = 0; end < 2; ++end )
+				{
+					cairo_save(cr);
+					cairo_translate(cr, endsX[end], endsY[end]);
+					cairo_rotate(cr, theta);
+					cairo_scale(cr, capForeshorten, 1.0);
+					cairo_arc(cr, 0, 0, capRadius, 0, 2 * M_PI);
+					cairo_fill(cr);
+					cairo_restore(cr);
+				}
+			}
 		}
 	}
 
@@ -817,7 +930,7 @@ bool isStructureP1( fstream& file )
 	return true;
 }
 
-void processFile( string filename )
+void processFile( string filename, int bondDrawMode )
 {
 	UnitCellPtr _unitCell = boost::make_shared<UnitCell>();
 
@@ -884,24 +997,45 @@ void processFile( string filename )
 */
 	file.close();
 	// add objects projected on the x/y plane of the screen
-	vector<ObjectPtr> objects = generateObjects(_unitCell);
+	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode);
 
 	// export the final file
 	exportFile(objects, filename);
 }
 
+void printUsage()
+{
+	cout << "Please provide a .vesta file for me to process..." << endl;
+	cout << "Optional: --bond-mode <0|1|2>" << endl;
+	cout << "  0 = bonds drawn between atom centers (default)" << endl;
+	cout << "  1 = bonds clipped to the projected atom circle (good for side-on views)" << endl;
+	cout << "  2 = bonds clipped to the real atom sphere, perspective-correct as in VESTA" << endl;
+}
+
 int main( int argc, char** argv )
 {
-	if ( argc == 1 )
-	{
-		cout << "Please provide a .vesta file for me to process..." << endl;
-		return 1;
-	}
+	int bondDrawMode = BOND_CENTER;
+	vector<string> files;
 
 	for ( int i = 1; i < argc; ++i )
 	{
-		cout << "Processing " << argv[i] << endl;
-		processFile(argv[i]);
+		string arg = argv[i];
+		if ( arg == "--bond-mode" && i + 1 < argc )
+			bondDrawMode = stoi(argv[++i]);
+		else
+			files.push_back(arg);
+	}
+
+	if ( files.empty() )
+	{
+		printUsage();
+		return 1;
+	}
+
+	for ( auto& filename : files )
+	{
+		cout << "Processing " << filename << endl;
+		processFile(filename, bondDrawMode);
 	}
 
 	 return 0;
