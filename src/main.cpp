@@ -892,7 +892,7 @@ void processFile( string filename )
 
 int main( int argc, char** argv )
 {
-	if ( argc == 0 )
+	if ( argc == 1 )
 	{
 		cout << "Please provide a .vesta file for me to process..." << endl;
 		return 1;
