@@ -1091,10 +1091,27 @@ double getYLength(vector<ObjectPtr> objects)
 	return max - min;
 }
 
-void exportFile(vector<ObjectPtr> objects, string filename)
+// Returns the directory component of a path, or "." if there is none.
+string dirName( const string& path )
 {
-	string outputFilename = filename.substr(0,filename.size()-5) + "pdf";
-	double scale = 20;	//
+	size_t sep = path.rfind('/');
+	return ( sep == string::npos ) ? "." : path.substr(0, sep);
+}
+
+// Strip directory components and the trailing .vesta extension from a file path,
+// returning just the bare name used to construct output filenames.
+string baseName( const string& path )
+{
+	size_t sep = path.rfind('/');
+	string name = ( sep == string::npos ) ? path : path.substr(sep + 1);
+	if ( name.size() >= 6 && name.substr(name.size()-6) == ".vesta" )
+		name = name.substr(0, name.size()-6);
+	return name;
+}
+
+void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20 )
+{
+	string outputFilename = outputDir + "/" + baseName(filename) + ".pdf";
 	double xMargin = 50;
 	double yMargin = 50;
 
@@ -1179,10 +1196,9 @@ void exportFile(vector<ObjectPtr> objects, string filename)
     cairo_surface_destroy(surface);
 }
 
-void exportSVG( vector<ObjectPtr> objects, string filename )
+void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20 )
 {
-	string outputFilename = filename.substr(0, filename.size()-5) + "svg";
-	double scale = 20;
+	string outputFilename = outputDir + "/" + baseName(filename) + ".svg";
 	double xMargin = 50;
 	double yMargin = 50;
 
@@ -1352,7 +1368,7 @@ bool isStructureP1( fstream& file )
 	return true;
 }
 
-void processFile( string filename, int bondDrawMode, bool showCellEdges, bool outputSVG = false, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
+void processFile( string filename, int bondDrawMode, bool showCellEdges, bool outputSVG = false, string outputDir = "", double scale = 20, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
 {
 	UnitCellPtr _unitCell = boost::make_shared<UnitCell>();
 
@@ -1422,11 +1438,12 @@ void processFile( string filename, int bondDrawMode, bool showCellEdges, bool ou
 	// add objects projected on the x/y plane of the screen
 	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode, overrideBondColor, bondColor);
 
-	// export the final file
+	// export the final file — default to alongside the input file
+	string effectiveOutputDir = outputDir.empty() ? dirName(filename) : outputDir;
 	if ( outputSVG )
-		exportSVG(objects, filename);
+		exportSVG(objects, filename, effectiveOutputDir, scale);
 	else
-		exportFile(objects, filename);
+		exportFile(objects, filename, effectiveOutputDir, scale);
 }
 
 void printUsage()
@@ -1441,9 +1458,16 @@ void printUsage()
 	cout << "Optional: --bond-color <name|R,G,B>" << endl;
 	cout << "  Override every real bond's color (leaves the wireframe box untouched)." << endl;
 	cout << "  Names: black, white, red, green, blue, gray. Or R,G,B with each 0-255." << endl;
+	cout << "Optional: --pdf" << endl;
+	cout << "  Output PDF instead of SVG (requires Cairo). SVG is the default." << endl;
 	cout << "Optional: --svg" << endl;
-	cout << "  Output SVG instead of PDF. SVG imports into Illustrator with atoms as" << endl;
-	cout << "  single fill+stroke objects and no clipping masks." << endl;
+	cout << "  Output SVG (default). Atoms import as single fill+stroke objects in" << endl;
+	cout << "  Illustrator; bonds grouped for easy recoloring; no clipping masks." << endl;
+	cout << "Optional: --output <directory>" << endl;
+	cout << "  Directory to write the output file into (default: current directory)." << endl;
+	cout << "Optional: --scale <number>" << endl;
+	cout << "  Output scale factor in points (or SVG units) per Angstrom (default: 20)." << endl;
+	cout << "  ~20 suits single-column figures; ~40-50 for larger or more detailed output." << endl;
 }
 
 // Parses --bond-color's argument: either a known name or an "R,G,B" triplet (0-255
@@ -1476,7 +1500,9 @@ int main( int argc, char** argv )
 {
 	int bondDrawMode = BOND_CENTER;
 	bool showCellEdges = true;
-	bool outputSVG = false;
+	bool outputSVG = true;
+	string outputDir = "";
+	double scale = 20;
 	bool overrideBondColor = false;
 	Vector3d bondColor = Vector3d::Zero();
 	vector<string> files;
@@ -1490,6 +1516,17 @@ int main( int argc, char** argv )
 			showCellEdges = false;
 		else if ( arg == "--svg" )
 			outputSVG = true;
+		else if ( arg == "--pdf" )
+			outputSVG = false;
+		else if ( arg == "--output" && i + 1 < argc )
+			outputDir = argv[++i];
+		else if ( arg == "--scale" && i + 1 < argc )
+			scale = stod(argv[++i]);
+		else if ( arg == "--help" || arg == "-h" )
+		{
+			printUsage();
+			return 0;
+		}
 		else if ( arg == "--bond-color" && i + 1 < argc )
 		{
 			string spec = argv[++i];
@@ -1511,7 +1548,7 @@ int main( int argc, char** argv )
 	for ( auto& filename : files )
 	{
 		cout << "Processing " << filename << endl;
-		processFile(filename, bondDrawMode, showCellEdges, outputSVG, overrideBondColor, bondColor);
+		processFile(filename, bondDrawMode, showCellEdges, outputSVG, outputDir, scale, overrideBondColor, bondColor);
 	}
 
 	 return 0;
