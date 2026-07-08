@@ -861,7 +861,7 @@ vector<BondSegment> clipBondAgainstAtoms( Vector2d p0, Vector2d p1, double z0, d
 	return result;
 }
 
-vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
+vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero(), double bondWidthScale = 1.0 )
 {
 	vector<ObjectPtr> result;
 	for ( auto atom : unitCell->getAtoms() )
@@ -879,7 +879,8 @@ vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode, bool 
 		// only ever touches real atom-to-atom bonds, matching the wireframe's
 		// long-standing out-of-scope status for any rendering changes here.
 		bool isWireframe = ( atomA->getElement() == "NULL" || atomB->getElement() == "NULL" );
-		Vector3d bondRGB = ( overrideBondColor && !isWireframe ) ? bondColor : bond->getRGB();
+		Vector3d bondRGB  = ( overrideBondColor && !isWireframe ) ? bondColor : bond->getRGB();
+		double bondSize   = isWireframe ? bond->getSize() : bond->getSize() * bondWidthScale;
 		pair<Vector2d,Vector2d> endpoints = bondEndpoints2D( atomA, atomB, bondDrawMode );
 
 		// In BOND_CLIP_REAL, cap the bond with a foreshortened ellipse representing
@@ -1006,7 +1007,7 @@ vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode, bool 
 				double pcs = ( j == 0 ) ? capStart : -1;
 				double pce = ( j == pieces.size() - 1 ) ? capEnd : -1;
 
-				result.push_back( boost::make_shared<Object>( "line", p0 + pStart * dir, bondRGB, z, bond->getSize(), p0 + pEnd * dir, pcs, pce, nextBondId));
+				result.push_back( boost::make_shared<Object>( "line", p0 + pStart * dir, bondRGB, z, bondSize, p0 + pEnd * dir, pcs, pce, nextBondId));
 			}
 		}
 		++nextBondId;
@@ -1028,10 +1029,9 @@ double getXLength(vector<ObjectPtr> objects)
 	{
 		if ( it->getType() == "circle" )
 		{
-			if ( it->getPosition()(0) > max )
-				max = it->getPosition()(0);
-			if ( it->getPosition()(0) < min )
-				min = it->getPosition()(0);
+			double r = 0.4 * it->getSize(); // drawn radius in world units
+			if ( it->getPosition()(0) + r > max ) max = it->getPosition()(0) + r;
+			if ( it->getPosition()(0) - r < min ) min = it->getPosition()(0) - r;
 		}
 		if ( it->getType() == "line" )
 		{
@@ -1040,10 +1040,8 @@ double getXLength(vector<ObjectPtr> objects)
 			double maxX = std::max(xStart,xEnd);
 			double minX = std::min(xStart,xEnd);
 
-			if ( maxX > max )
-				max = maxX;
-			if ( minX < min )
-				min = minX;
+			if ( maxX > max ) max = maxX;
+			if ( minX < min ) min = minX;
 		}
 	}
 
@@ -1064,10 +1062,9 @@ double getYLength(vector<ObjectPtr> objects)
 	{
 		if ( it->getType() == "circle" )
 		{
-			if ( it->getPosition()(1) + it->getSize() > max )
-				max = it->getPosition()(1);
-			if ( it->getPosition()(1)  - it->getSize() < min )
-				min = it->getPosition()(1);
+			double r = 0.4 * it->getSize(); // drawn radius in world units
+			if ( it->getPosition()(1) + r > max ) max = it->getPosition()(1) + r;
+			if ( it->getPosition()(1) - r < min ) min = it->getPosition()(1) - r;
 		}
 		if ( it->getType() == "line" )
 		{
@@ -1076,10 +1073,8 @@ double getYLength(vector<ObjectPtr> objects)
 			double maxY = std::max(yStart,yEnd);
 			double minY = std::min(yStart,yEnd);
 
-			if ( maxY > max )
-				max = maxY;
-			if ( minY < min )
-				min = minY;
+			if ( maxY > max ) max = maxY;
+			if ( minY < min ) min = minY;
 		}
 	}
 
@@ -1109,7 +1104,7 @@ string baseName( const string& path )
 	return name;
 }
 
-void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20 )
+void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20, double atomOutline = 1.0 )
 {
 	string outputFilename = outputDir + "/" + baseName(filename) + ".pdf";
 	double xMargin = 50;
@@ -1130,7 +1125,7 @@ void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = 
 
 		if ( object->getType() == "circle" )
 		{
-			cairo_set_line_width (cr, 1);
+			cairo_set_line_width (cr, atomOutline * (scale / 20.0));
 			Vector3d rgb = object->getRGB();
 
 			cairo_arc(cr, xMargin + scale*object->getPosition()(0), yLength + yMargin - scale*object->getPosition()(1), 0.4*scale*object->getSize(), 0, 2 * M_PI);
@@ -1144,7 +1139,8 @@ void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = 
 
 		if ( object->getType() == "line" )
 		{
-			cairo_set_line_width (cr, object->getSize());
+			double lineWidth = object->getSize() * (scale / 20.0);
+			cairo_set_line_width (cr, lineWidth);
 
 			Vector3d rgb = object->getRGB();
 			cairo_set_source_rgb (cr, rgb(0)/255.0, rgb(1)/255.0,rgb(2)/255.0);
@@ -1165,7 +1161,7 @@ void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = 
 			double capEnd = object->getCapEnd();
 			if ( capStart > 1e-3 || capEnd > 1e-3 )
 			{
-				double capRadius = 0.5 * object->getSize();
+				double capRadius = 0.5 * object->getSize() * (scale / 20.0);
 				double theta = atan2(y1 - y0, x1 - x0);
 
 				if ( capStart > 1e-3 )
@@ -1196,7 +1192,7 @@ void exportFile( vector<ObjectPtr> objects, string filename, string outputDir = 
     cairo_surface_destroy(surface);
 }
 
-void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20 )
+void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = ".", double scale = 20, double atomOutline = 1.0 )
 {
 	string outputFilename = outputDir + "/" + baseName(filename) + ".svg";
 	double xMargin = 50;
@@ -1271,9 +1267,10 @@ void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = "
 			double cy = yLength + yMargin - scale * obj->getPosition()(1);
 			double r  = 0.4 * scale * obj->getSize();
 			fprintf(f, "  <circle cx=\"%.3f\" cy=\"%.3f\" r=\"%.3f\" "
-			           "fill=\"rgb(%d,%d,%d)\" stroke=\"black\" stroke-width=\"1\"/>\n",
+			           "fill=\"rgb(%d,%d,%d)\" stroke=\"black\" stroke-width=\"%.3f\"/>\n",
 			        cx, cy, r,
-			        (int)round(rgb(0)), (int)round(rgb(1)), (int)round(rgb(2)));
+			        (int)round(rgb(0)), (int)round(rgb(1)), (int)round(rgb(2)),
+			        atomOutline * (scale / 20.0));
 		}
 		else
 		{
@@ -1285,6 +1282,15 @@ void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = "
 			Vector3d rgb = segs[0]->getRGB();
 			int ri = (int)round(rgb(0)), gi = (int)round(rgb(1)), bi = (int)round(rgb(2));
 
+			// If any segment in the group has a perspective cap (mode 2), render bond
+			// bodies as filled rectangles so bodies and caps share the fill attribute
+			// and can be recolored together. Without caps (modes 0/1), use plain stroked
+			// lines — simpler to manipulate in a vector editor.
+			bool hasCaps = false;
+			for ( auto& obj : segs )
+				if ( obj->getCapStart() > 1e-3 || obj->getCapEnd() > 1e-3 )
+					{ hasCaps = true; break; }
+
 			fprintf(f, "  <g>\n");
 			for ( auto& obj : segs )
 			{
@@ -1293,42 +1299,52 @@ void exportSVG( vector<ObjectPtr> objects, string filename, string outputDir = "
 				double x1 = xMargin + scale * obj->getDirection()(0);
 				double y1 = yLength + yMargin - scale * obj->getDirection()(1);
 
-				// Bond body as a filled rectangle
-				double ddx = x1 - x0, ddy = y1 - y0;
-				double len = sqrt(ddx*ddx + ddy*ddy);
-				if ( len > 1e-6 )
+				if ( hasCaps )
 				{
-					double nx = -ddy / len, ny = ddx / len; // perpendicular unit vector
-					double h  = 0.5 * obj->getSize();
-					double p0x = x0 + nx*h, p0y = y0 + ny*h;
-					double p1x = x0 - nx*h, p1y = y0 - ny*h;
-					double p2x = x1 - nx*h, p2y = y1 - ny*h;
-					double p3x = x1 + nx*h, p3y = y1 + ny*h;
-					fprintf(f, "    <path d=\"M %.3f,%.3f L %.3f,%.3f L %.3f,%.3f L %.3f,%.3f Z\" "
-					           "fill=\"rgb(%d,%d,%d)\"/>\n",
-					        p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, ri, gi, bi);
+					// Filled rectangle so body and caps share the same fill attribute
+					double ddx = x1 - x0, ddy = y1 - y0;
+					double len = sqrt(ddx*ddx + ddy*ddy);
+					if ( len > 1e-6 )
+					{
+						double nx = -ddy / len, ny = ddx / len;
+						double h  = 0.5 * obj->getSize() * (scale / 20.0);
+						double p0x = x0 + nx*h, p0y = y0 + ny*h;
+						double p1x = x0 - nx*h, p1y = y0 - ny*h;
+						double p2x = x1 - nx*h, p2y = y1 - ny*h;
+						double p3x = x1 + nx*h, p3y = y1 + ny*h;
+						fprintf(f, "    <path d=\"M %.3f,%.3f L %.3f,%.3f L %.3f,%.3f L %.3f,%.3f Z\" "
+						           "fill=\"rgb(%d,%d,%d)\"/>\n",
+						        p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, ri, gi, bi);
+					}
+
+					// Perspective-correct end caps
+					double capStart = obj->getCapStart();
+					double capEnd   = obj->getCapEnd();
+					if ( capStart > 1e-3 || capEnd > 1e-3 )
+					{
+						double capRadius = 0.5 * obj->getSize() * (scale / 20.0);
+						double theta     = atan2(y1 - y0, x1 - x0);
+						double thetaDeg  = theta * 180.0 / M_PI;
+
+						if ( capStart > 1e-3 )
+							fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
+							           "fill=\"rgb(%d,%d,%d)\" "
+							           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
+							        capRadius * capStart, capRadius, ri, gi, bi, x0, y0, thetaDeg);
+
+						if ( capEnd > 1e-3 )
+							fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
+							           "fill=\"rgb(%d,%d,%d)\" "
+							           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
+							        capRadius * capEnd, capRadius, ri, gi, bi, x1, y1, thetaDeg);
+					}
 				}
-
-				// Perspective-correct end caps (BOND_CLIP_REAL only)
-				double capStart = obj->getCapStart();
-				double capEnd   = obj->getCapEnd();
-				if ( capStart > 1e-3 || capEnd > 1e-3 )
+				else
 				{
-					double capRadius = 0.5 * obj->getSize();
-					double theta     = atan2(y1 - y0, x1 - x0);
-					double thetaDeg  = theta * 180.0 / M_PI;
-
-					if ( capStart > 1e-3 )
-						fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
-						           "fill=\"rgb(%d,%d,%d)\" "
-						           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
-						        capRadius * capStart, capRadius, ri, gi, bi, x0, y0, thetaDeg);
-
-					if ( capEnd > 1e-3 )
-						fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
-						           "fill=\"rgb(%d,%d,%d)\" "
-						           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
-						        capRadius * capEnd, capRadius, ri, gi, bi, x1, y1, thetaDeg);
+					// No caps: plain stroked line, simpler to work with in a vector editor
+					fprintf(f, "    <line x1=\"%.3f\" y1=\"%.3f\" x2=\"%.3f\" y2=\"%.3f\" "
+					           "stroke=\"rgb(%d,%d,%d)\" stroke-width=\"%.3f\"/>\n",
+					        x0, y0, x1, y1, ri, gi, bi, obj->getSize() * (scale / 20.0));
 				}
 			}
 			fprintf(f, "  </g>\n");
@@ -1368,7 +1384,7 @@ bool isStructureP1( fstream& file )
 	return true;
 }
 
-void processFile( string filename, int bondDrawMode, bool showCellEdges, bool outputSVG = false, string outputDir = "", double scale = 20, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
+void processFile( string filename, int bondDrawMode, bool showCellEdges, bool outputSVG = false, string outputDir = "", double scale = 20, double bondWidthScale = 1.0, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero(), double atomOutline = 1.0 )
 {
 	UnitCellPtr _unitCell = boost::make_shared<UnitCell>();
 
@@ -1436,14 +1452,14 @@ void processFile( string filename, int bondDrawMode, bool showCellEdges, bool ou
 */
 	file.close();
 	// add objects projected on the x/y plane of the screen
-	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode, overrideBondColor, bondColor);
+	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode, overrideBondColor, bondColor, bondWidthScale);
 
 	// export the final file — default to alongside the input file
 	string effectiveOutputDir = outputDir.empty() ? dirName(filename) : outputDir;
 	if ( outputSVG )
-		exportSVG(objects, filename, effectiveOutputDir, scale);
+		exportSVG(objects, filename, effectiveOutputDir, scale, atomOutline);
 	else
-		exportFile(objects, filename, effectiveOutputDir, scale);
+		exportFile(objects, filename, effectiveOutputDir, scale, atomOutline);
 }
 
 void printUsage()
@@ -1468,6 +1484,12 @@ void printUsage()
 	cout << "Optional: --scale <number>" << endl;
 	cout << "  Output scale factor in points (or SVG units) per Angstrom (default: 20)." << endl;
 	cout << "  ~20 suits single-column figures; ~40-50 for larger or more detailed output." << endl;
+	cout << "Optional: --bond-width <factor>" << endl;
+	cout << "  Multiply all real bond widths by this factor (default: 1.5)." << endl;
+	cout << "  Does not affect the unit cell wireframe." << endl;
+	cout << "Optional: --atom-outline <factor>" << endl;
+	cout << "  Atom outline stroke width as a multiple of scale/20 (default: 1.0)." << endl;
+	cout << "  Use 0 to suppress outlines entirely." << endl;
 }
 
 // Parses --bond-color's argument: either a known name or an "R,G,B" triplet (0-255
@@ -1503,6 +1525,8 @@ int main( int argc, char** argv )
 	bool outputSVG = true;
 	string outputDir = "";
 	double scale = 20;
+	double bondWidthScale = 1.5;
+	double atomOutline = 1.0;
 	bool overrideBondColor = false;
 	Vector3d bondColor = Vector3d::Zero();
 	vector<string> files;
@@ -1522,6 +1546,10 @@ int main( int argc, char** argv )
 			outputDir = argv[++i];
 		else if ( arg == "--scale" && i + 1 < argc )
 			scale = stod(argv[++i]);
+		else if ( arg == "--bond-width" && i + 1 < argc )
+			bondWidthScale = stod(argv[++i]);
+		else if ( arg == "--atom-outline" && i + 1 < argc )
+			atomOutline = stod(argv[++i]);
 		else if ( arg == "--help" || arg == "-h" )
 		{
 			printUsage();
@@ -1548,7 +1576,7 @@ int main( int argc, char** argv )
 	for ( auto& filename : files )
 	{
 		cout << "Processing " << filename << endl;
-		processFile(filename, bondDrawMode, showCellEdges, outputSVG, outputDir, scale, overrideBondColor, bondColor);
+		processFile(filename, bondDrawMode, showCellEdges, outputSVG, outputDir, scale, bondWidthScale, overrideBondColor, bondColor, atomOutline);
 	}
 
 	 return 0;

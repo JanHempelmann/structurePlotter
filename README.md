@@ -1,12 +1,17 @@
 # structurePlotter
+
 Based on [Peter Müller's original structurePlotter](https://github.com/p-c-mueller/structurePlotter).
 Extended with depth-correct bond rendering, SVG output, and various command-line options.
 
 A small command-line tool that converts a `.vesta` crystal structure file into a
 depth-correct 2D-projected vector graphic (SVG by default, PDF optional).
 
+## Gallery
 
-Features:
+![NaCl — mode 2, no cell edges](examples/NaCl.svg)
+
+## Features
+
 - Painter's algorithm with geometric self-occlusion correction: bonds are clipped
   against their own endpoint atoms in true 3D, so they correctly stop at atom surfaces
 - Three bond rendering modes (center-to-center, screen-clipped, perspective-correct)
@@ -59,6 +64,8 @@ processed in one invocation.
 | `--bond-mode <0\|1\|2>` | Bond rendering mode (default: `0`) |
 | `--no-cell-edges` | Skip the unit cell wireframe box |
 | `--bond-color <name\|R,G,B>` | Override all bond colors (wireframe unaffected) |
+| `--bond-width <factor>` | Multiply all bond widths by this factor (default: `1.5`; wireframe unaffected) |
+| `--atom-outline <factor>` | Atom outline stroke as a multiple of `scale/20` (default: `1.0`; use `0` to suppress) |
 | `--output <directory>` | Write output to a specific directory |
 | `--scale <number>` | Scale factor in pts/Å (default: `20`; try `40`–`50` for larger figures) |
 | `--svg` | Output SVG — **default** |
@@ -83,8 +90,8 @@ with each component in 0–255, e.g. `--bond-color 255,128,0`.
 # Default: SVG alongside the input file, mode 0, with cell edges
 structurePlotter structure.vesta
 
-# Perspective-correct bonds, no cell box, output in current directory
-structurePlotter --bond-mode 2 --no-cell-edges --output . structure.vesta
+# Perspective-correct bonds, no cell box, larger scale, output in current directory
+structurePlotter --bond-mode 2 --no-cell-edges --scale 40 --output . structure.vesta
 
 # Black bonds, larger scale, PDF output
 structurePlotter --bond-color black --scale 40 --pdf structure.vesta
@@ -93,9 +100,14 @@ structurePlotter --bond-color black --scale 40 --pdf structure.vesta
 structurePlotter --bond-mode 2 structure1.vesta structure2.vesta structure3.vesta
 ```
 
-## Illustrator / Inkscape workflow
+The `examples/` directory contains the `.vesta` source files for the gallery above.
+
+## Illustrator / CorelDraw / Inkscape workflow
 
 Open the SVG with **File → Open** (not Place). Each atom is a single object with
-both fill and stroke. Each bond (all segments and perspective caps) is a `<g>` group
-— select the group and change the fill once to recolor the whole bond including its
-end caps.
+both fill and stroke. Each bond is a `<g>` group — select it and recolor in one step.
+
+- **Modes 0 and 1**: bond segments are stroked lines (`stroke` attribute). Select the
+  group and change the stroke color to recolor the whole bond.
+- **Mode 2**: bond segments are filled rectangles and end caps are filled ellipses
+  (all `fill` attribute), so fill and caps can be recolored together in one step.
