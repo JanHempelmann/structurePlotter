@@ -256,9 +256,11 @@ class Object
 public:
 	Object(){};
 	~Object(){};
-	// capForeshorten < 0 means "no end caps drawn" (used for circles, and lines in modes
-	// that don't want a perspective-correct cylinder end cap).
-	Object( string type, Vector2d position, Vector3d rgb, double z, double size = 0, Vector2d direction = Vector2d::Zero(), double capForeshorten = -1 )
+	// capStart/capEnd < 0 means "no end cap drawn there" (used for circles, for lines in
+	// modes that don't want a perspective-correct cylinder end cap, and for the internal
+	// boundaries created when a bond gets split into multiple visible sub-segments by
+	// occlusion clipping - only the sub-segment ends that touch a real atom get a cap).
+	Object( string type, Vector2d position, Vector3d rgb, double z, double size = 0, Vector2d direction = Vector2d::Zero(), double capStart = -1, double capEnd = -1, int bondId = -1 )
 	{
 		_type = type;
 		_position = position;
@@ -270,7 +272,9 @@ public:
 		_size = size;
 		_direction = direction;
 		_rgb = rgb;
-		_capForeshorten = capForeshorten;
+		_capStart = capStart;
+		_capEnd = capEnd;
+		_bondId = bondId;
 	}
 
 	string getType(){return _type;}
@@ -278,7 +282,9 @@ public:
 	Vector2d getPosition(){ return _position; }
 	Vector2d getDirection(){ return _direction; }
 	Vector3d getRGB(){return _rgb;}
-	double getCapForeshorten(){ return _capForeshorten; }
+	double getCapStart(){ return _capStart; }
+	double getCapEnd(){ return _capEnd; }
+	int getBondId(){ return _bondId; }
 	void addX( double x ) { _position(0) += x; _direction(0)+= x; }
 	void addY( double y ) { _position(1) += y; _direction(1)+=y; }
 
@@ -297,7 +303,9 @@ private:
 	double _size;
 	Vector2d _direction;
 	Vector3d _rgb;
-	double _capForeshorten;
+	double _capStart;
+	double _capEnd;
+	int _bondId;
 
 };
 typedef boost::shared_ptr<Object> ObjectPtr;

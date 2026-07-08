@@ -11,11 +11,11 @@
 #include <string>
 #include <Eigen/Core>
 #include <vector>
+#include <map>
 #include <math.h>
 #include <algorithm>
 #include <boost/make_shared.hpp>
 #include <cairo-pdf.h>
-#include <cairo-svg.h>
 #include <stdio.h>
 
 #include "cellParameters.hpp"
@@ -712,7 +712,156 @@ pair<Vector2d,Vector2d> bondEndpoints2D( AtomPtr atomA, AtomPtr atomB, int bondD
 	return make_pair( start.head(2), end.head(2) );
 }
 
-vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode )
+// True z at the two already-trimmed drawn endpoints, found by linear interpolation
+// between the atoms' real z values. p0/p1 always lie on the segment from atomA's to
+// atomB's 2D position (trimming only moves points inward along that same line), so
+// their fractional position along that line gives the right interpolation parameter -
+// exact for BOND_CLIP_REAL, and a consistent approximation for the other two modes.
+pair<double,double> bondEndpointZs( AtomPtr atomA, AtomPtr atomB, Vector2d p0, Vector2d p1 )
+{
+	Vector2d a2 = atomA->getCoordinatesReal().head(2);
+	Vector2d b2 = atomB->getCoordinatesReal().head(2);
+	double zA = atomA->getCoordinatesReal()(2);
+	double zB = atomB->getCoordinatesReal()(2);
+
+	double lenSq = (b2 - a2).squaredNorm();
+	if ( lenSq < 1e-18 )
+		return make_pair(zA, zB);
+
+	double t0 = (p0 - a2).dot(b2 - a2) / lenSq;
+	double t1 = (p1 - a2).dot(b2 - a2) / lenSq;
+
+	return make_pair( zA + t0 * (zB - zA), zA + t1 * (zB - zA) );
+}
+
+struct BondSegment
+{
+	Vector2d p0, p1;
+};
+
+// Finds the t (in [0,1]) along segment [p0,p1] where it crosses the boundary of circle
+// (center c, radius r), localized to just one endpoint's neighborhood - used to confine a
+// segment's own-atom occlusion-key boost (see generateObjects) to only the portion that's
+// actually inside that atom's 2D disc, instead of inflating the whole segment's key.
+// fromStart=true checks whether p0 starts inside the circle and returns where it exits
+// moving forward (the larger root); fromStart=false checks p1 and returns where it exits
+// moving backward (the smaller root). Returns -1 if that endpoint isn't inside the circle
+// at all (no localized boost needed there).
+double findDiscBoundaryT( Vector2d p0, Vector2d p1, Vector2d c, double r, bool fromStart )
+{
+	Vector2d probe = fromStart ? p0 : p1;
+	if ( (probe - c).norm() >= r )
+		return -1;
+
+	Vector2d d = p1 - p0;
+	Vector2d f = p0 - c;
+
+	double a = d.dot(d);
+	if ( a < 1e-18 )
+		return -1;
+
+	double b = 2 * f.dot(d);
+	double cc = f.dot(f) - r * r;
+	double discriminant = b * b - 4 * a * cc;
+	if ( discriminant < 0 )
+		return -1;
+
+	double sqrtDisc = sqrt(discriminant);
+	double t = fromStart ? (-b + sqrtDisc) / (2 * a) : (-b - sqrtDisc) / (2 * a);
+	return min(1.0, max(0.0, t));
+}
+
+// Finds where the bond's true 3D path (p0,z0) to (p1,z1) passes through the inside of
+// atom's sphere (true 3D center, true 3D radius r), and appends that t-interval to
+// dropIntervals - it's genuinely occluded there, being literally embedded in the
+// sphere's opaque volume, not just behind its flat center plane or its 2D silhouette.
+// This is an exact 3D line-sphere intersection, not a 2D circle test: a bond can dip
+// inside a sphere and re-emerge partway through its silhouette (whenever the far
+// endpoint is enough nearer the viewer to overtake the sphere's near surface before
+// reaching the silhouette's rim), and only a true 3D test captures that partial split -
+// a single front/behind sample over the whole 2D-overlap interval cannot. A bond's own
+// endpoint atom falls out of this for free: right at it, the 3D path point is exactly
+// the atom's own center, deepest inside its own sphere, so the interval starts there
+// and only ends where the path actually exits the sphere.
+void computeOcclusionInterval( Vector2d p0, Vector2d p1, double z0, double z1,
+                                Vector3d center, double r,
+                                vector<pair<double,double>>& dropIntervals )
+{
+	Vector3d p0_3(p0(0), p0(1), z0);
+	Vector3d p1_3(p1(0), p1(1), z1);
+
+	Vector3d d = p1_3 - p0_3;
+	Vector3d f = p0_3 - center;
+
+	double a = d.dot(d);
+	if ( a < 1e-18 )
+		return;
+
+	double b = 2 * f.dot(d);
+	double cc = f.dot(f) - r * r;
+	double discriminant = b * b - 4 * a * cc;
+
+	if ( discriminant < 0 )
+		return; // the bond's 3D path never enters the sphere
+
+	double sqrtDisc = sqrt(discriminant);
+	double tEnter = (-b - sqrtDisc) / (2 * a);
+	double tExit = (-b + sqrtDisc) / (2 * a);
+
+	double tStart = max(0.0, tEnter);
+	double tEnd = min(1.0, tExit);
+
+	if ( tEnd - tStart < 1e-9 )
+		return; // overlap with the drawn segment is empty (or a single point)
+
+	dropIntervals.push_back( make_pair(tStart, tEnd) );
+}
+
+// Clips a bond's drawn segment against every atom it overlaps in 2D, removing the
+// portions that are genuinely behind some atom (by true interpolated depth, not by
+// sort-key approximation), and returns the surviving visible piece(s).
+vector<BondSegment> clipBondAgainstAtoms( Vector2d p0, Vector2d p1, double z0, double z1, const vector<AtomPtr>& atoms )
+{
+	vector<pair<double,double>> dropIntervals;
+
+	for ( auto atom : atoms )
+	{
+		double r = atomRadius(atom);
+		if ( r < 1e-9 )
+			continue;
+
+		computeOcclusionInterval(p0, p1, z0, z1, atom->getCoordinatesReal(), r, dropIntervals);
+	}
+
+	if ( dropIntervals.empty() )
+		return vector<BondSegment>{ BondSegment{p0, p1} };
+
+	sort(dropIntervals.begin(), dropIntervals.end());
+
+	vector<pair<double,double>> merged;
+	for ( auto& interval : dropIntervals )
+	{
+		if ( !merged.empty() && interval.first <= merged.back().second + 1e-9 )
+			merged.back().second = max(merged.back().second, interval.second);
+		else
+			merged.push_back(interval);
+	}
+
+	vector<BondSegment> result;
+	double cursor = 0.0;
+	for ( auto& interval : merged )
+	{
+		if ( interval.first - cursor > 1e-4 )
+			result.push_back( BondSegment{ p0 + cursor * (p1 - p0), p0 + interval.first * (p1 - p0) } );
+		cursor = max(cursor, interval.second);
+	}
+	if ( 1.0 - cursor > 1e-4 )
+		result.push_back( BondSegment{ p0 + cursor * (p1 - p0), p1 } );
+
+	return result;
+}
+
+vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
 {
 	vector<ObjectPtr> result;
 	for ( auto atom : unitCell->getAtoms() )
@@ -720,9 +869,18 @@ vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode )
 		result.push_back( boost::make_shared<Object>( "circle", atom->getCoordinatesReal().head(2), atom->getRGB(), atom->getCoordinatesReal()(2), atom->getSize() ));
 	}
 
+	int nextBondId = 0;
 	for ( auto bond : unitCell->getBonds() )
 	{
-		pair<Vector2d,Vector2d> endpoints = bondEndpoints2D( bond->getFrom(), bond->getTo(), bondDrawMode );
+		AtomPtr atomA = bond->getFrom();
+		AtomPtr atomB = bond->getTo();
+		// Wireframe unit-cell edges are also Bonds internally, connecting placeholder
+		// "NULL" atoms (see addUnitCell) - exclude them from the color override so it
+		// only ever touches real atom-to-atom bonds, matching the wireframe's
+		// long-standing out-of-scope status for any rendering changes here.
+		bool isWireframe = ( atomA->getElement() == "NULL" || atomB->getElement() == "NULL" );
+		Vector3d bondRGB = ( overrideBondColor && !isWireframe ) ? bondColor : bond->getRGB();
+		pair<Vector2d,Vector2d> endpoints = bondEndpoints2D( atomA, atomB, bondDrawMode );
 
 		// In BOND_CLIP_REAL, cap the bond with a foreshortened ellipse representing
 		// its own circular cross section (a true cylinder end cap), rather than a
@@ -732,12 +890,126 @@ vector<ObjectPtr> generateObjects( UnitCellPtr unitCell, int bondDrawMode )
 		double capForeshorten = -1;
 		if ( bondDrawMode == BOND_CLIP_REAL )
 		{
-			Vector3d axis = bond->getTo()->getCoordinatesReal() - bond->getFrom()->getCoordinatesReal();
+			Vector3d axis = atomB->getCoordinatesReal() - atomA->getCoordinatesReal();
 			double axisLen = axis.norm();
 			capForeshorten = ( axisLen > 1e-9 ) ? fabs(axis(2) / axisLen) : 1.0;
 		}
 
-		result.push_back( boost::make_shared<Object>( "line", endpoints.first, bond->getRGB(), bond->getCoordinatesReal()(2), bond->getSize(), endpoints.second, capForeshorten));
+		// Clip the bond's body against its own two atoms only, by true interpolated
+		// depth - not by sort-key approximation - removing the portion genuinely behind
+		// its far endpoint (the self-occlusion bug). Deliberately NOT clipped against
+		// other, unrelated atoms: that would interrupt bonds in places the old z-key
+		// approach never did (third-party ordering is out of scope and was working
+		// acceptably as-is). Caps only go on whichever surviving sub-segment end is the
+		// outermost (i.e. genuinely touches the bond's real atom there); internal clip
+		// boundaries never get one.
+		pair<double,double> zs = bondEndpointZs( atomA, atomB, endpoints.first, endpoints.second );
+		vector<AtomPtr> ownAtoms = { atomA, atomB };
+		vector<BondSegment> segments = clipBondAgainstAtoms( endpoints.first, endpoints.second, zs.first, zs.second, ownAtoms );
+
+		for ( size_t i = 0; i < segments.size(); ++i )
+		{
+			double capStart = ( i == 0 ) ? capForeshorten : -1;
+			double capEnd = ( i == segments.size() - 1 ) ? capForeshorten : -1;
+			double baseZ = bond->getCoordinatesReal()(2);
+
+			// A surviving segment's clip boundary against its own atom sits exactly where
+			// the bond's 3D path crosses that atom's sphere surface - which, away from the
+			// silhouette's dead center, is generally *inside* the atom's projected 2D disc
+			// (the sphere bulges toward the viewer there). That sliver between the clip
+			// boundary and the disc's rim is genuinely meant to be visible, in front of the
+			// atom's surface - but the atom's own circle is a flat opaque fill covering its
+			// whole disc, so it must be painted *before* this segment there, or it wrongly
+			// hides that correctly-visible sliver. The shared bond sort key (near atom's
+			// true z, unboosted) doesn't guarantee that. This affects BOND_CENTER (which
+			// starts/ends literally at the atom's center) and also BOND_CLIP_REAL (whose
+			// trim point sits exactly on the true 3D sphere surface, but - unless the trim
+			// direction happens to be exactly perpendicular to the viewing axis - that
+			// surface point's 2D *projection* still generally falls inside the atom's 2D
+			// silhouette). BOND_CLIP_SCREEN is the only mode that's actually exempt: it
+			// trims by the full 2D screen radius, so its endpoint sits exactly on the 2D
+			// disc's rim, never inside it.
+			//
+			// The boost must be localized to just the portion still inside that atom's 2D
+			// disc - boosting the *whole* segment (e.g. when one segment touches both atoms
+			// and the two needed boosts differ) lets the bigger boost leak onto the part
+			// near the *other* atom, where it's not needed, making that part draw after
+			// unrelated third-party atoms/bonds it has no business being in front of.
+			bool needA = false, needB = false; // does this segment need a localized boost for that atom at all?
+			double tA = 0, tB = 1; // boundary of the boosted zone, only meaningful if needA/needB
+			bool crossed = false; // protection zones overlap (short bond vs big atoms): fall back to one unsplit piece
+			if ( bondDrawMode == BOND_CENTER || bondDrawMode == BOND_CLIP_REAL )
+			{
+				// Only the *farther* atom's end can ever legitimately show the bond poking
+				// out in front of it (the path's depth, right after trimming/leaving that
+				// atom's center, only rises above that atom's own center depth when the
+				// *other* atom is nearer - otherwise it only ever sinks further behind,
+				// staying occluded for as long as it remains within that atom's 2D disc).
+				// Near the *nearer* atom's end, no boost is ever needed: that atom's own
+				// circle already naturally draws on top via the plain unboosted key.
+				bool aIsFarther = atomA->getCoordinatesReal()(2) < atomB->getCoordinatesReal()(2);
+				bool bIsFarther = atomB->getCoordinatesReal()(2) < atomA->getCoordinatesReal()(2);
+
+				// Splitting off a piece is only worth it if boosting would actually raise
+				// the key above the bond's own plain baseZ - otherwise max(baseZ, boost)
+				// reduces to baseZ everywhere anyway, and splitting just fragments the
+				// bond into multiple identically-keyed pieces for no behavioural gain
+				// (purely cosmetic harm for editing in a vector tool).
+				if ( i == 0 && aIsFarther && atomA->getCoordinatesReal()(2) + atomA->getSize() + 1e-6 > baseZ )
+				{
+					double t = findDiscBoundaryT( segments[i].p0, segments[i].p1, atomA->getCoordinatesReal().head(2), atomRadius(atomA), true );
+					if ( t >= 0 ) { needA = true; tA = t; }
+				}
+				if ( i == segments.size() - 1 && bIsFarther && atomB->getCoordinatesReal()(2) + atomB->getSize() + 1e-6 > baseZ )
+				{
+					double t = findDiscBoundaryT( segments[i].p0, segments[i].p1, atomB->getCoordinatesReal().head(2), atomRadius(atomB), false );
+					if ( t >= 0 ) { needB = true; tB = t; }
+				}
+				if ( needA && needB && tA >= tB )
+					crossed = true;
+			}
+
+			Vector2d p0 = segments[i].p0;
+			Vector2d p1 = segments[i].p1;
+			Vector2d dir = p1 - p0;
+
+			vector<pair<double,double>> pieces; // (tStart, tEnd)
+			if ( !crossed )
+			{
+				double cursor = 0.0;
+				if ( needA ) { pieces.push_back({0.0, tA}); cursor = tA; }
+				if ( needB ) { if ( tB > cursor ) pieces.push_back({cursor, tB}); cursor = tB; }
+				if ( 1.0 - cursor > 1e-9 ) pieces.push_back({cursor, 1.0});
+			}
+			if ( pieces.empty() )
+				pieces.push_back({0.0, 1.0});
+
+			for ( size_t j = 0; j < pieces.size(); ++j )
+			{
+				double pStart = pieces[j].first, pEnd = pieces[j].second;
+				double z = baseZ;
+				if ( crossed )
+				{
+					// no clean unboosted middle to preserve anyway - boost for whichever
+					// own atom(s) this segment end touches, same as a simple shared key.
+					if ( needA ) z = max( z, atomA->getCoordinatesReal()(2) + atomA->getSize() + 1e-6 );
+					if ( needB ) z = max( z, atomB->getCoordinatesReal()(2) + atomB->getSize() + 1e-6 );
+				}
+				else
+				{
+					if ( needA && pStart < tA + 1e-9 )
+						z = max( z, atomA->getCoordinatesReal()(2) + atomA->getSize() + 1e-6 );
+					if ( needB && pEnd > tB - 1e-9 )
+						z = max( z, atomB->getCoordinatesReal()(2) + atomB->getSize() + 1e-6 );
+				}
+
+				double pcs = ( j == 0 ) ? capStart : -1;
+				double pce = ( j == pieces.size() - 1 ) ? capEnd : -1;
+
+				result.push_back( boost::make_shared<Object>( "line", p0 + pStart * dir, bondRGB, z, bond->getSize(), p0 + pEnd * dir, pcs, pce, nextBondId));
+			}
+		}
+		++nextBondId;
 	}
 
 	// sort objects by z value
@@ -835,15 +1107,14 @@ void exportFile(vector<ObjectPtr> objects, string filename)
 
     cout << "Exporting " << outputFilename << endl;
 
-	for ( auto object : objects )
+	for ( size_t idx = 0; idx < objects.size(); ++idx )
 	{
+		ObjectPtr object = objects[idx];
+
 		if ( object->getType() == "circle" )
 		{
 			cairo_set_line_width (cr, 1);
 			Vector3d rgb = object->getRGB();
-//			cout << object->getSize() << endl;
-
-//			cout << "c" << xMargin + scale*object->getPosition()(0) << " " << yMargin + scale*object->getPosition()(1) << " at " << object->getZ() <<endl;
 
 			cairo_arc(cr, xMargin + scale*object->getPosition()(0), yLength + yMargin - scale*object->getPosition()(1), 0.4*scale*object->getSize(), 0, 2 * M_PI);
 
@@ -851,16 +1122,14 @@ void exportFile(vector<ObjectPtr> objects, string filename)
 			cairo_fill_preserve(cr);
 			cairo_set_source_rgb (cr, 0, 0,0);
 			cairo_stroke (cr);
+			continue;
 		}
 
 		if ( object->getType() == "line" )
 		{
 			cairo_set_line_width (cr, object->getSize());
 
-/*			cout << "l from " << xMargin + scale*object->getPosition()(0) << " " << yMargin + scale*object->getPosition()(1) << " at " << object->getZ() << endl;
-			cout << "l to " << xMargin + scale*object->getDirection()(0) << " " << yMargin + scale*object->getDirection()(1) << endl;
-			cout << "l total " << (scale*object->getDirection() - scale*object->getPosition()).norm() << endl;
-*/			Vector3d rgb = object->getRGB();
+			Vector3d rgb = object->getRGB();
 			cairo_set_source_rgb (cr, rgb(0)/255.0, rgb(1)/255.0,rgb(2)/255.0);
 
 			double x0 = xMargin + scale*object->getPosition()(0);
@@ -869,26 +1138,35 @@ void exportFile(vector<ObjectPtr> objects, string filename)
 			double y1 = yMargin + yLength - scale*object->getDirection()(1);
 
 			cairo_move_to (cr, x0, y0);
-			//cairo_rel_line_to(cr, scale*object->getDirection()(0), scale*object->getDirection()(1));
 			cairo_line_to (cr, x1, y1);
-//			cairo_close_path (cr);
 			cairo_stroke (cr);
 
-			// perspective-correct cylinder end caps (BOND_CLIP_REAL only)
-			double capForeshorten = object->getCapForeshorten();
-			if ( capForeshorten > 1e-3 )
+			// perspective-correct cylinder end caps (BOND_CLIP_REAL only). capStart/capEnd
+			// are independent so an internal clip boundary (from occlusion splitting) never
+			// gets a cap - only a sub-segment end that touches a genuine atom does.
+			double capStart = object->getCapStart();
+			double capEnd = object->getCapEnd();
+			if ( capStart > 1e-3 || capEnd > 1e-3 )
 			{
 				double capRadius = 0.5 * object->getSize();
 				double theta = atan2(y1 - y0, x1 - x0);
-				double endsX[2] = { x0, x1 };
-				double endsY[2] = { y0, y1 };
 
-				for ( int end = 0; end < 2; ++end )
+				if ( capStart > 1e-3 )
 				{
 					cairo_save(cr);
-					cairo_translate(cr, endsX[end], endsY[end]);
+					cairo_translate(cr, x0, y0);
 					cairo_rotate(cr, theta);
-					cairo_scale(cr, capForeshorten, 1.0);
+					cairo_scale(cr, capStart, 1.0);
+					cairo_arc(cr, 0, 0, capRadius, 0, 2 * M_PI);
+					cairo_fill(cr);
+					cairo_restore(cr);
+				}
+				if ( capEnd > 1e-3 )
+				{
+					cairo_save(cr);
+					cairo_translate(cr, x1, y1);
+					cairo_rotate(cr, theta);
+					cairo_scale(cr, capEnd, 1.0);
 					cairo_arc(cr, 0, 0, capRadius, 0, 2 * M_PI);
 					cairo_fill(cr);
 					cairo_restore(cr);
@@ -899,6 +1177,150 @@ void exportFile(vector<ObjectPtr> objects, string filename)
 
     cairo_destroy(cr);
     cairo_surface_destroy(surface);
+}
+
+void exportSVG( vector<ObjectPtr> objects, string filename )
+{
+	string outputFilename = filename.substr(0, filename.size()-5) + "svg";
+	double scale = 20;
+	double xMargin = 50;
+	double yMargin = 50;
+
+	double xLength = ceil(scale * getXLength(objects));
+	double yLength = ceil(scale * getYLength(objects));
+
+	double width  = xLength + 2 * xMargin;
+	double height = yLength + 2 * yMargin;
+
+	FILE* f = fopen(outputFilename.c_str(), "w");
+	if ( !f )
+	{
+		cout << "Could not open " << outputFilename << " for writing." << endl;
+		return;
+	}
+
+	cout << "Exporting " << outputFilename << endl;
+
+	// Separate atom circles (bondId=-1) from bond segment/cap objects. Each bond's
+	// objects are grouped into a <g> in the SVG so the bond can be recolored as a unit
+	// in Illustrator. Bond bodies use a filled <path> (rectangle) rather than a stroked
+	// <line> so that bond bodies and end caps share the same fill attribute - selecting
+	// the group and changing fill updates the whole bond at once.
+	//
+	// Group sort key: max z within the group. This ensures a bond's perspective-boosted
+	// sliver near its farther atom draws after that atom's circle (self-occlusion fix),
+	// at the cost of very slightly approximate third-party ordering in rare edge cases -
+	// an accepted trade-off consistent with the overall painter's-algorithm approach.
+	vector<ObjectPtr> circles;
+	std::map<int, vector<ObjectPtr>> bondGroupMap;
+
+	for ( auto& obj : objects )
+	{
+		if ( obj->getBondId() < 0 )
+			circles.push_back(obj);
+		else
+			bondGroupMap[obj->getBondId()].push_back(obj);
+	}
+
+	struct BondGroup { int id; double maxZ; };
+	vector<BondGroup> bondGroups;
+	for ( auto& kv : bondGroupMap )
+	{
+		double maxZ = -1e18;
+		for ( auto& o : kv.second )
+			maxZ = max(maxZ, o->getZ());
+		bondGroups.push_back({ kv.first, maxZ });
+	}
+	sort(bondGroups.begin(), bondGroups.end(),
+	     []( const BondGroup& a, const BondGroup& b ){ return a.maxZ < b.maxZ; });
+
+	fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+	fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+	           "width=\"%.1f\" height=\"%.1f\" viewBox=\"0 0 %.1f %.1f\">\n",
+	        width, height, width, height);
+
+	// Merge-emit circles and bond groups in ascending z order
+	size_t ci = 0, bg = 0;
+	while ( ci < circles.size() || bg < bondGroups.size() )
+	{
+		double cz  = ( ci < circles.size()   ) ? circles[ci]->getZ()    : 1e18;
+		double bgz = ( bg < bondGroups.size() ) ? bondGroups[bg].maxZ   : 1e18;
+
+		if ( cz <= bgz )
+		{
+			// emit one atom circle
+			auto& obj = circles[ci++];
+			Vector3d rgb = obj->getRGB();
+			double cx = xMargin + scale * obj->getPosition()(0);
+			double cy = yLength + yMargin - scale * obj->getPosition()(1);
+			double r  = 0.4 * scale * obj->getSize();
+			fprintf(f, "  <circle cx=\"%.3f\" cy=\"%.3f\" r=\"%.3f\" "
+			           "fill=\"rgb(%d,%d,%d)\" stroke=\"black\" stroke-width=\"1\"/>\n",
+			        cx, cy, r,
+			        (int)round(rgb(0)), (int)round(rgb(1)), (int)round(rgb(2)));
+		}
+		else
+		{
+			// emit one bond group
+			int gid = bondGroups[bg++].id;
+			auto& segs = bondGroupMap[gid];
+
+			// All segments in a bond share the same color
+			Vector3d rgb = segs[0]->getRGB();
+			int ri = (int)round(rgb(0)), gi = (int)round(rgb(1)), bi = (int)round(rgb(2));
+
+			fprintf(f, "  <g>\n");
+			for ( auto& obj : segs )
+			{
+				double x0 = xMargin + scale * obj->getPosition()(0);
+				double y0 = yLength + yMargin - scale * obj->getPosition()(1);
+				double x1 = xMargin + scale * obj->getDirection()(0);
+				double y1 = yLength + yMargin - scale * obj->getDirection()(1);
+
+				// Bond body as a filled rectangle
+				double ddx = x1 - x0, ddy = y1 - y0;
+				double len = sqrt(ddx*ddx + ddy*ddy);
+				if ( len > 1e-6 )
+				{
+					double nx = -ddy / len, ny = ddx / len; // perpendicular unit vector
+					double h  = 0.5 * obj->getSize();
+					double p0x = x0 + nx*h, p0y = y0 + ny*h;
+					double p1x = x0 - nx*h, p1y = y0 - ny*h;
+					double p2x = x1 - nx*h, p2y = y1 - ny*h;
+					double p3x = x1 + nx*h, p3y = y1 + ny*h;
+					fprintf(f, "    <path d=\"M %.3f,%.3f L %.3f,%.3f L %.3f,%.3f L %.3f,%.3f Z\" "
+					           "fill=\"rgb(%d,%d,%d)\"/>\n",
+					        p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y, ri, gi, bi);
+				}
+
+				// Perspective-correct end caps (BOND_CLIP_REAL only)
+				double capStart = obj->getCapStart();
+				double capEnd   = obj->getCapEnd();
+				if ( capStart > 1e-3 || capEnd > 1e-3 )
+				{
+					double capRadius = 0.5 * obj->getSize();
+					double theta     = atan2(y1 - y0, x1 - x0);
+					double thetaDeg  = theta * 180.0 / M_PI;
+
+					if ( capStart > 1e-3 )
+						fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
+						           "fill=\"rgb(%d,%d,%d)\" "
+						           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
+						        capRadius * capStart, capRadius, ri, gi, bi, x0, y0, thetaDeg);
+
+					if ( capEnd > 1e-3 )
+						fprintf(f, "    <ellipse cx=\"0\" cy=\"0\" rx=\"%.3f\" ry=\"%.3f\" "
+						           "fill=\"rgb(%d,%d,%d)\" "
+						           "transform=\"translate(%.3f,%.3f) rotate(%.3f)\"/>\n",
+						        capRadius * capEnd, capRadius, ri, gi, bi, x1, y1, thetaDeg);
+				}
+			}
+			fprintf(f, "  </g>\n");
+		}
+	}
+
+	fprintf(f, "</svg>\n");
+	fclose(f);
 }
 
 bool isStructureP1( fstream& file )
@@ -930,7 +1352,7 @@ bool isStructureP1( fstream& file )
 	return true;
 }
 
-void processFile( string filename, int bondDrawMode )
+void processFile( string filename, int bondDrawMode, bool showCellEdges, bool outputSVG = false, bool overrideBondColor = false, Vector3d bondColor = Vector3d::Zero() )
 {
 	UnitCellPtr _unitCell = boost::make_shared<UnitCell>();
 
@@ -950,7 +1372,8 @@ void processFile( string filename, int bondDrawMode )
 
 	// read unit cell
 	readCellParameters( file, _unitCell );
-	addUnitCell(_unitCell);
+	if ( showCellEdges )
+		addUnitCell(_unitCell);
 
 	// read boundary
 	readBoundary(file, _unitCell);
@@ -997,10 +1420,13 @@ void processFile( string filename, int bondDrawMode )
 */
 	file.close();
 	// add objects projected on the x/y plane of the screen
-	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode);
+	vector<ObjectPtr> objects = generateObjects(_unitCell, bondDrawMode, overrideBondColor, bondColor);
 
 	// export the final file
-	exportFile(objects, filename);
+	if ( outputSVG )
+		exportSVG(objects, filename);
+	else
+		exportFile(objects, filename);
 }
 
 void printUsage()
@@ -1010,11 +1436,49 @@ void printUsage()
 	cout << "  0 = bonds drawn between atom centers (default)" << endl;
 	cout << "  1 = bonds clipped to the projected atom circle (good for side-on views)" << endl;
 	cout << "  2 = bonds clipped to the real atom sphere, perspective-correct as in VESTA" << endl;
+	cout << "Optional: --no-cell-edges" << endl;
+	cout << "  Skip drawing the unit cell's wireframe box outline." << endl;
+	cout << "Optional: --bond-color <name|R,G,B>" << endl;
+	cout << "  Override every real bond's color (leaves the wireframe box untouched)." << endl;
+	cout << "  Names: black, white, red, green, blue, gray. Or R,G,B with each 0-255." << endl;
+	cout << "Optional: --svg" << endl;
+	cout << "  Output SVG instead of PDF. SVG imports into Illustrator with atoms as" << endl;
+	cout << "  single fill+stroke objects and no clipping masks." << endl;
+}
+
+// Parses --bond-color's argument: either a known name or an "R,G,B" triplet (0-255
+// each). Returns false (and leaves color untouched) if the spec isn't recognized.
+bool parseColor( const string& spec, Vector3d& color )
+{
+	if ( spec == "black" ) { color = Vector3d(0,0,0); return true; }
+	if ( spec == "white" ) { color = Vector3d(255,255,255); return true; }
+	if ( spec == "red" )   { color = Vector3d(255,0,0); return true; }
+	if ( spec == "green" ) { color = Vector3d(0,255,0); return true; }
+	if ( spec == "blue" )  { color = Vector3d(0,0,255); return true; }
+	if ( spec == "gray" || spec == "grey" ) { color = Vector3d(128,128,128); return true; }
+
+	stringstream ss(spec);
+	string token;
+	vector<double> components;
+	while ( getline(ss, token, ',') )
+	{
+		try { components.push_back(stod(token)); }
+		catch (...) { return false; }
+	}
+	if ( components.size() != 3 )
+		return false;
+
+	color = Vector3d(components[0], components[1], components[2]);
+	return true;
 }
 
 int main( int argc, char** argv )
 {
 	int bondDrawMode = BOND_CENTER;
+	bool showCellEdges = true;
+	bool outputSVG = false;
+	bool overrideBondColor = false;
+	Vector3d bondColor = Vector3d::Zero();
 	vector<string> files;
 
 	for ( int i = 1; i < argc; ++i )
@@ -1022,6 +1486,18 @@ int main( int argc, char** argv )
 		string arg = argv[i];
 		if ( arg == "--bond-mode" && i + 1 < argc )
 			bondDrawMode = stoi(argv[++i]);
+		else if ( arg == "--no-cell-edges" )
+			showCellEdges = false;
+		else if ( arg == "--svg" )
+			outputSVG = true;
+		else if ( arg == "--bond-color" && i + 1 < argc )
+		{
+			string spec = argv[++i];
+			if ( parseColor(spec, bondColor) )
+				overrideBondColor = true;
+			else
+				cout << "Unrecognized --bond-color value \"" << spec << "\", ignoring." << endl;
+		}
 		else
 			files.push_back(arg);
 	}
@@ -1035,7 +1511,7 @@ int main( int argc, char** argv )
 	for ( auto& filename : files )
 	{
 		cout << "Processing " << filename << endl;
-		processFile(filename, bondDrawMode);
+		processFile(filename, bondDrawMode, showCellEdges, outputSVG, overrideBondColor, bondColor);
 	}
 
 	 return 0;
